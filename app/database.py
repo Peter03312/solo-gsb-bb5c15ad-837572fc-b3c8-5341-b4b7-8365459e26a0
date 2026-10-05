@@ -177,12 +177,15 @@ CREATE TABLE IF NOT EXISTS toll_rate_versions (
 -- 各费率版本下的全局费率区间快照（全量物化：生成新版本时从上一版本复制
 -- 全部既有航段区间，再删除/重写 changed_seg_id 的部分）。费率为非负整数
 -- 分/分钟；同版本同航段的半开区间互不交叠（服务层保证），未覆盖分钟费率 0。
+-- 费率以 TEXT 十进制字符串存储：合法费率为任意非负整数（不受 64 位限制），
+-- 写入 str(整数)、读出 int(文本)，Python 任意精度整数精确往返，不溢出、
+-- 不截断、不浮点舍入（旧库由 _migrate_toll_money 重建为 TEXT 列）。
 CREATE TABLE IF NOT EXISTS toll_rates (
     version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),
     seg_id        INTEGER NOT NULL REFERENCES segments(seg_id),
     start_minute  INTEGER NOT NULL CHECK (start_minute >= 0),
     end_minute    INTEGER NOT NULL CHECK (end_minute > start_minute),  -- 半开区间止（不含）
-    rate_cents_per_minute INTEGER NOT NULL CHECK (rate_cents_per_minute >= 0),  -- 非负整数分/分钟
+    rate_cents_per_minute TEXT NOT NULL,  -- 非负整数分/分钟的十进制字符串（任意精度）
     PRIMARY KEY (version, seg_id, start_minute)
 );
 
@@ -191,10 +194,13 @@ CREATE TABLE IF NOT EXISTS toll_rates (
 -- 之后费率版本再如何变化都不改写旧账单。segments 为逐段计费结果 JSON：
 -- 金额 = 该段固化航时 travel_time × 进入分钟(start_minute)命中区间费率，
 -- 未覆盖分钟费率 0；total_cents 为各段金额之和（非负整数分）。
+-- total_cents 以 TEXT 十进制字符串存储：费率与航时的乘积、逐段求和可为
+-- 任意大的非负整数（不受 64 位限制），任意精度精确落库（旧库由
+-- _migrate_toll_money 重建为 TEXT 列）。
 CREATE TABLE IF NOT EXISTS toll_bills (
     trip_id       INTEGER PRIMARY KEY REFERENCES confirmed_trips(trip_id),
     version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),  -- 开单时固化的费率版本
-    total_cents   INTEGER NOT NULL CHECK (total_cents >= 0),
+    total_cents   TEXT NOT NULL,                           -- 账单总额（非负整数分的十进制字符串，任意精度）
     segments      TEXT NOT NULL,                                           -- 逐段计费结果 JSON
     billed_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -217,10 +223,12 @@ CREATE TABLE IF NOT EXISTS trip_reschedules (
 -- （bill_trip_id 唯一兜底并发）。等额冲销——逐段金额与总额取账单原值的
 -- 相反数（账单为正、冲销为负，绝对值完全相等），费率版本引用沿用账单
 -- 版本（旧账单不随费率变化，冲销同样固化）。重复作废不重复冲销。
+-- total_cents 以 TEXT 十进制字符串存储：等额负数冲销可为任意大的非正
+-- 整数（与账单绝对值完全相等，不受 64 位限制），任意精度精确落库。
 CREATE TABLE IF NOT EXISTS toll_reversals (
     bill_trip_id  INTEGER PRIMARY KEY REFERENCES toll_bills(trip_id),
     version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),
-    total_cents   INTEGER NOT NULL CHECK (total_cents <= 0),               -- 非正整数分（与账单等额相反）
+    total_cents   TEXT NOT NULL,                -- 非正整数分的十进制字符串（与账单等额相反，任意精度）
     segments      TEXT NOT NULL,                                           -- 逐段冲销结果 JSON（金额取反）
     reversed_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -266,7 +274,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     - 为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为
       NULL，表示直接提交参数确认、无档案引用）与 berth_id / work_minutes /
       work_start_minute / work_end_minute 泊位作业快照列（既有行程为 NULL，
-      表示未指定泊位的旧确认，其请求与响应保持原样）。"""
+      表示未指定泊位的旧确认，其请求与响应保持原样）；
+    - 通行费三张表的金额列（toll_rates.rate_cents_per_minute、
+      toll_bills.total_cents、toll_reversals.total_cents）由 64 位 INTEGER
+      重建为 TEXT 十进制字符串列（见 _migrate_toll_money）。"""
     tide_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
     rev_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_revisions)").fetchall()}
     trip_cols = {r["name"] for r in conn.execute("PRAGMA table_info(confirmed_trips)").fetchall()}
@@ -295,6 +306,111 @@ def _migrate(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    _migrate_toll_money(conn)
+
+
+# 通行费金额列重建：(表名, 金额列, 新表 DDL, 旧表数据复制 SELECT)。
+# 金额一律 CAST 为十进制文本；其余列原样拷贝，行数与键值不变。
+_MONEY_TABLE_REBUILDS = (
+    (
+        "toll_rates",
+        "rate_cents_per_minute",
+        """CREATE TABLE toll_rates__money (
+            version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),
+            seg_id        INTEGER NOT NULL REFERENCES segments(seg_id),
+            start_minute  INTEGER NOT NULL CHECK (start_minute >= 0),
+            end_minute    INTEGER NOT NULL CHECK (end_minute > start_minute),
+            rate_cents_per_minute TEXT NOT NULL,
+            PRIMARY KEY (version, seg_id, start_minute)
+        )""",
+        """INSERT INTO toll_rates__money(version, seg_id, start_minute,
+              end_minute, rate_cents_per_minute)
+           SELECT version, seg_id, start_minute, end_minute,
+              CAST(rate_cents_per_minute AS TEXT) FROM toll_rates""",
+    ),
+    (
+        "toll_bills",
+        "total_cents",
+        """CREATE TABLE toll_bills__money (
+            trip_id       INTEGER PRIMARY KEY REFERENCES confirmed_trips(trip_id),
+            version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),
+            total_cents   TEXT NOT NULL,
+            segments      TEXT NOT NULL,
+            billed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        )""",
+        """INSERT INTO toll_bills__money(trip_id, version, total_cents,
+              segments, billed_at)
+           SELECT trip_id, version, CAST(total_cents AS TEXT), segments,
+              billed_at FROM toll_bills""",
+    ),
+    (
+        "toll_reversals",
+        "total_cents",
+        """CREATE TABLE toll_reversals__money (
+            bill_trip_id  INTEGER PRIMARY KEY REFERENCES toll_bills(trip_id),
+            version       INTEGER NOT NULL REFERENCES toll_rate_versions(version),
+            total_cents   TEXT NOT NULL,
+            segments      TEXT NOT NULL,
+            reversed_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        )""",
+        """INSERT INTO toll_reversals__money(bill_trip_id, version, total_cents,
+              segments, reversed_at)
+           SELECT bill_trip_id, version, CAST(total_cents AS TEXT), segments,
+              reversed_at FROM toll_reversals""",
+    ),
+)
+
+
+def _money_column_type(conn, table: str, column: str) -> str:
+    """读取列的声明类型（大写）；列不存在时返回空串。"""
+    for r in conn.execute(f"PRAGMA table_info({table})").fetchall():
+        if r["name"] == column:
+            return (r["type"] or "").upper()
+    return ""
+
+
+def _migrate_toll_money(conn: sqlite3.Connection) -> None:
+    """通行费金额列由 64 位 INTEGER 重建为 TEXT 十进制字符串列。
+
+    早期库的 ``toll_rates.rate_cents_per_minute`` / ``toll_bills.total_cents``
+    / ``toll_reversals.total_cents`` 是 SQLite INTEGER（64 位有符号）：合法
+    的大整数费率（≥ 2^63）无法写入，费率与固化航时的乘积、逐段求和、等额
+    负数冲销也会越界报 500；且 INTEGER 亲和列会把放不下的整数字符串转成
+    REAL 造成浮点舍入。重建为 TEXT 列后，金额以十进制字符串落库，Python
+    任意精度整数精确往返——不溢出、不截断、不浮点舍入。
+
+    既有行的金额 ``CAST(... AS TEXT)`` 原样保留（数值完全不变，既有版本、
+    账单、冲销仍可查）；整组重建在单事务内完成（中断回滚，重启重跑），
+    列已是 TEXT 时直接跳过（幂等可重入）。
+    """
+    pending = [
+        (table, ddl, copy)
+        for table, column, ddl, copy in _MONEY_TABLE_REBUILDS
+        if _money_column_type(conn, table, column) != "TEXT"
+    ]
+    if not pending:
+        return
+    # 重建表（DROP + RENAME）须暂时关闭外键检查（该 PRAGMA 在事务内无效，
+    # 故在 BEGIN 前设置）；复制不改动任何键值，提交前 foreign_key_check 兜底。
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table, ddl, copy in pending:
+                conn.execute(f"DROP TABLE IF EXISTS {table}__money")
+                conn.execute(ddl)
+                conn.execute(copy)
+                conn.execute(f"DROP TABLE {table}")
+                conn.execute(f"ALTER TABLE {table}__money RENAME TO {table}")
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"通行费金额列迁移后外键校验失败: {violations}")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +456,7 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
 
         # 通行费费率初始版本：A->B(seg 1) 分时段费率；其余航段未覆盖分钟费率为 0。
         # 财务可随后通过 PUT /api/segments/{seg_id}/toll-rates 整组替换生成新版本。
+        # 费率以 TEXT 十进制字符串存储（任意精度非负整数分/分钟）。
         conn.execute(
             "INSERT INTO toll_rate_versions(changed_seg_id, note)"
             " VALUES (1, '初始演示费率版本：A->B 航段分时段费率（分/分钟）')"
@@ -347,7 +464,7 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
         conn.executemany(
             "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute,"
             " rate_cents_per_minute) VALUES (1, 1, ?, ?, ?)",
-            [(0, 360, 2), (360, 720, 1), (720, 1440, 2)],
+            [(0, 360, "2"), (360, 720, "1"), (720, 1440, "2")],
         )
 
         # 泊位演示数据：为内港码头 D 登记一个全天开放泊位 D1；调度员可通过

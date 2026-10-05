@@ -583,10 +583,11 @@ def test_concurrent_bill_and_void_exactly_one_outcome(client):
         else:
             # 已开单：4 分钟 × 费率 3 = 12 分；若已作废则必有且仅有一张
             # 等额相反冲销，未作废则无冲销
-            assert bill["total_cents"] == 12, tid
+            # （金额列以 TEXT 十进制字符串存储，读出统一 int() 后比较）
+            assert int(bill["total_cents"]) == 12, tid
             if is_void is not None:
                 assert reversal is not None, tid
-                assert reversal["total_cents"] == -bill["total_cents"], tid
+                assert int(reversal["total_cents"]) == -int(bill["total_cents"]), tid
             else:
                 assert reversal is None, tid
 
@@ -662,6 +663,7 @@ def test_concurrent_void_direct_route_creates_single_reversal(client):
     assert sorted(results) == [200, 201]
     conn = connect()
     assert conn.execute("SELECT COUNT(*) FROM toll_reversals").fetchone()[0] == 1
-    assert conn.execute(
-        "SELECT total_cents FROM toll_reversals").fetchone()["total_cents"] == -20
+    # 金额列以 TEXT 十进制字符串存储，读出统一 int() 后比较
+    assert int(conn.execute(
+        "SELECT total_cents FROM toll_reversals").fetchone()["total_cents"]) == -20
     conn.close()

@@ -12,6 +12,15 @@
 * 组内区间交叠或航段未知 -> 整次拒绝、不生成版本（旧版本原样可查）；
 * 某分钟未被任何区间覆盖 -> 费率为 0。
 
+**金额任意精度（本轮修复）**：合法费率是任意非负整数（不受 64 位限制，
+如 2^63 乃至更大）；费率与固化航时的乘积、逐段求和、等额负数冲销同样
+可为任意大的整数。数据库金额列（``toll_rates.rate_cents_per_minute``、
+``toll_bills.total_cents``、``toll_reversals.total_cents``）以 TEXT
+十进制字符串存储，写入 ``str(整数)``、读出 ``int(文本)``，全程 Python
+任意精度整数运算——不溢出、不截断、不浮点舍入；逐段金额 JSON 同样以
+完整十进制数字落库与回读。旧库由 ``database._migrate_toll_money`` 重建
+为 TEXT 列，既有版本、账单、冲销数值不变、仍可查询。
+
 开单（凭行程号）
 ----------------
 
@@ -45,6 +54,18 @@ from ..errors import ApiError
 from .controls import segment_exists
 
 
+def _cents(value) -> int:
+    """金额/费率列读出值统一转 Python int（任意精度）。
+
+    金额列以 TEXT 十进制字符串存储（见 ``database.SCHEMA`` 与
+    ``database._migrate_toll_money``）；兼容 SQLite 直接返回 int 的情形
+    （如表达式结果），文本按十进制解析，绝不经过浮点。
+    """
+    if isinstance(value, int):
+        return value
+    return int(value)
+
+
 # ---- 费率区间校验 ----------------------------------------------------------------
 
 def validate_rate_intervals(items) -> list[tuple[int, int, int]]:
@@ -53,6 +74,8 @@ def validate_rate_intervals(items) -> list[tuple[int, int, int]]:
     非法区间 -> 422 INVALID_TOLL_RATE_INTERVAL；
     组内半开区间交叠 -> 422 OVERLAPPING_TOLL_RATE_INTERVAL。
     费率允许为 0（免费时段）；起点非负、终点大于起点。
+    费率是任意大的非负整数（分/分钟）：只校验类型与符号，不设上限，
+    金额精度由任意精度整数存储与运算保证。
     """
     intervals: list[tuple[int, int, int]] = []
     for idx, it in enumerate(items):
@@ -60,9 +83,11 @@ def validate_rate_intervals(items) -> list[tuple[int, int, int]]:
         end = it["end_minute"]
         rate = it["rate_cents_per_minute"]
         # 布尔值是 int 的子类，财务整数口径（分钟、分）不接受；
-        # 起点非负、终点大于起点、费率非负。
+        # 分钟与费率都必须是整数（任意精度），起点非负、终点大于起点、费率非负。
         if (isinstance(start, bool) or isinstance(end, bool)
                 or isinstance(rate, bool)
+                or not isinstance(start, int) or not isinstance(end, int)
+                or not isinstance(rate, int)
                 or start < 0 or end <= start or rate < 0):
             raise ApiError(
                 422,
@@ -120,12 +145,14 @@ def replace_segment_rates(conn, seg_id: int, items, note=None) -> dict:
         new_version = cur.lastrowid
 
         # 全量物化：继承前一版本全部航段的费率区间（不可变版本独立可查），
-        # 再以本次提交整组替换 changed_seg_id 航段。
+        # 再以本次提交整组替换 changed_seg_id 航段。费率以 TEXT 十进制字符串
+        # 落库（CAST 对已是 TEXT 的值恒等，兼容任何历史存储形态）。
         if prev_version is not None:
             conn.execute(
                 "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute,"
                 " rate_cents_per_minute)"
-                " SELECT ?, seg_id, start_minute, end_minute, rate_cents_per_minute"
+                " SELECT ?, seg_id, start_minute, end_minute,"
+                " CAST(rate_cents_per_minute AS TEXT)"
                 " FROM toll_rates WHERE version = ?",
                 (new_version, prev_version),
             )
@@ -136,7 +163,7 @@ def replace_segment_rates(conn, seg_id: int, items, note=None) -> dict:
         conn.executemany(
             "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute,"
             " rate_cents_per_minute) VALUES (?, ?, ?, ?, ?)",
-            [(new_version, seg_id, s, e, r) for s, e, r in intervals],
+            [(new_version, seg_id, s, e, str(r)) for s, e, r in intervals],
         )
         out = _load_version(conn, new_version)
         conn.execute("COMMIT")
@@ -174,7 +201,7 @@ def _load_version(conn, version: int) -> dict:
         "rates": [
             {"seg_id": r["seg_id"], "start_minute": r["start_minute"],
              "end_minute": r["end_minute"],
-             "rate_cents_per_minute": r["rate_cents_per_minute"]}
+             "rate_cents_per_minute": _cents(r["rate_cents_per_minute"])}
             for r in rows
         ],
     }
@@ -228,14 +255,19 @@ def _load_rate_map(conn, version: int) -> dict[int, list[tuple[int, int, int]]]:
         (version,),
     ).fetchall():
         rate_map.setdefault(r["seg_id"], []).append(
-            (r["start_minute"], r["end_minute"], r["rate_cents_per_minute"])
+            (r["start_minute"], r["end_minute"],
+             _cents(r["rate_cents_per_minute"]))
         )
     return rate_map
 
 
 def _bill_segments(itinerary: list[dict],
                    rate_map: dict[int, list[tuple[int, int, int]]]) -> list[dict]:
-    """按确认快照各段进入分钟计费（航时取快照固化值）。"""
+    """按确认快照各段进入分钟计费（航时取快照固化值）。
+
+    段金额 = 固化航时 × 费率，为 Python 任意精度整数（费率可任意大，
+    乘积不溢出、不截断、不浮点舍入）。
+    """
     segments = []
     for idx, leg in enumerate(itinerary):
         entry = leg["start_minute"]
@@ -273,7 +305,7 @@ def _load_reversal(conn, trip_id: int):
     return {
         "trip_id": row["bill_trip_id"],
         "version": row["version"],
-        "total_cents": row["total_cents"],
+        "total_cents": _cents(row["total_cents"]),
         "segments": json.loads(row["segments"]),
         "reversed_at": row["reversed_at"],
     }
@@ -289,7 +321,7 @@ def bill_out(conn, trip_id: int) -> dict:
     return {
         "trip_id": row["trip_id"],
         "version": row["version"],
-        "total_cents": row["total_cents"],
+        "total_cents": _cents(row["total_cents"]),
         "segments": json.loads(row["segments"]),
         "billed_at": row["billed_at"],
         "reversal": _load_reversal(conn, trip_id),
@@ -336,13 +368,14 @@ def issue_bill(conn, trip_id: int) -> tuple[dict, bool]:
 
         itinerary = json.loads(trip["itinerary"])
         segments = _bill_segments(itinerary, _load_rate_map(conn, version))
+        # 逐段求和为 Python 任意精度整数（可超 64 位），以十进制字符串落库
         total = sum(s["amount_cents"] for s in segments)
 
         try:
             conn.execute(
                 "INSERT INTO toll_bills(trip_id, version, total_cents, segments)"
                 " VALUES (?, ?, ?, ?)",
-                (trip_id, version, total, json.dumps(segments)),
+                (trip_id, version, str(total), json.dumps(segments)),
             )
         except sqlite3.IntegrityError:
             # 兜底并发竞争（BEGIN IMMEDIATE 串行化下正常不会到达；SQLite 语句
@@ -400,11 +433,12 @@ def create_reversal_in_void(conn, trip_id: int) -> None:
          "amount_cents": -s["amount_cents"]}
         for s in segments
     ]
-    total = -bill["total_cents"]
+    # 等额负数冲销：任意精度整数取反（绝对值与账单完全相等），十进制字符串落库
+    total = -_cents(bill["total_cents"])
     conn.execute(
         "INSERT INTO toll_reversals(bill_trip_id, version, total_cents, segments)"
         " VALUES (?, ?, ?, ?)",
-        (trip_id, bill["version"], total, json.dumps(reversal_segments)),
+        (trip_id, bill["version"], str(total), json.dumps(reversal_segments)),
     )
 
 
