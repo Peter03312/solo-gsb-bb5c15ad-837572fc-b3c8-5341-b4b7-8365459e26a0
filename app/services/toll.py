@@ -37,6 +37,19 @@
 作废先提交则随后的开单读到作废标识而拒绝；开单先提交则随后的作废在同一事务
 内读到账单并生成冲销。唯一约束（``toll_bills.trip_id`` /
 ``toll_reversals.bill_trip_id``）兜底并发竞争，保证不重复开单、不重复冲销。
+
+金额边界（任意精度整数分）
+--------------------------
+
+合法费率是**没有上限的非负整数**（分/分钟）；费率 × 固化航时的乘积、逐段
+求和的账单总额、以及等额负数冲销都可能是超出 SQLite INTEGER（int64）范围
+的整数。为此三张表的金额列（``toll_rates.rate_cents_per_minute``、
+``toll_bills.total_cents``、``toll_reversals.total_cents``）一律以
+**十进制文本**落库：写入侧 ``str(int)``、读取侧 ``int(text)``，计算全程使用
+Python 任意精度整数，HTTP 层以 JSON 整数原样返回——不溢出、不截断、不经
+浮点舍入。旧库的 INTEGER 金额列由 ``database._migrate`` 重建为 TEXT
+（既有值 CAST 保留）。``segments`` 逐段金额本就在 JSON 文本列中，JSON 整数
+同样是任意精度。
 """
 import json
 import sqlite3
@@ -136,7 +149,8 @@ def replace_segment_rates(conn, seg_id: int, items, note=None) -> dict:
         conn.executemany(
             "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute,"
             " rate_cents_per_minute) VALUES (?, ?, ?, ?, ?)",
-            [(new_version, seg_id, s, e, r) for s, e, r in intervals],
+            # 费率以十进制文本落库：任意精度非负整数都精确可存（不受 int64 限制）
+            [(new_version, seg_id, s, e, str(r)) for s, e, r in intervals],
         )
         out = _load_version(conn, new_version)
         conn.execute("COMMIT")
@@ -174,7 +188,8 @@ def _load_version(conn, version: int) -> dict:
         "rates": [
             {"seg_id": r["seg_id"], "start_minute": r["start_minute"],
              "end_minute": r["end_minute"],
-             "rate_cents_per_minute": r["rate_cents_per_minute"]}
+             # 十进制文本 -> 任意精度整数（JSON 整数原样输出，不转浮点）
+             "rate_cents_per_minute": int(r["rate_cents_per_minute"])}
             for r in rows
         ],
     }
@@ -228,7 +243,8 @@ def _load_rate_map(conn, version: int) -> dict[int, list[tuple[int, int, int]]]:
         (version,),
     ).fetchall():
         rate_map.setdefault(r["seg_id"], []).append(
-            (r["start_minute"], r["end_minute"], r["rate_cents_per_minute"])
+            # 十进制文本 -> 任意精度整数费率
+            (r["start_minute"], r["end_minute"], int(r["rate_cents_per_minute"]))
         )
     return rate_map
 
@@ -273,7 +289,8 @@ def _load_reversal(conn, trip_id: int):
     return {
         "trip_id": row["bill_trip_id"],
         "version": row["version"],
-        "total_cents": row["total_cents"],
+        # 十进制文本 -> 任意精度整数（非正，与账单等额相反）
+        "total_cents": int(row["total_cents"]),
         "segments": json.loads(row["segments"]),
         "reversed_at": row["reversed_at"],
     }
@@ -289,7 +306,8 @@ def bill_out(conn, trip_id: int) -> dict:
     return {
         "trip_id": row["trip_id"],
         "version": row["version"],
-        "total_cents": row["total_cents"],
+        # 十进制文本 -> 任意精度整数（非负总额）
+        "total_cents": int(row["total_cents"]),
         "segments": json.loads(row["segments"]),
         "billed_at": row["billed_at"],
         "reversal": _load_reversal(conn, trip_id),
@@ -336,13 +354,14 @@ def issue_bill(conn, trip_id: int) -> tuple[dict, bool]:
 
         itinerary = json.loads(trip["itinerary"])
         segments = _bill_segments(itinerary, _load_rate_map(conn, version))
+        # 逐段求和为任意精度整数（Python int 无界），以十进制文本落库
         total = sum(s["amount_cents"] for s in segments)
 
         try:
             conn.execute(
                 "INSERT INTO toll_bills(trip_id, version, total_cents, segments)"
                 " VALUES (?, ?, ?, ?)",
-                (trip_id, version, total, json.dumps(segments)),
+                (trip_id, version, str(total), json.dumps(segments)),
             )
         except sqlite3.IntegrityError:
             # 兜底并发竞争（BEGIN IMMEDIATE 串行化下正常不会到达；SQLite 语句
@@ -400,11 +419,12 @@ def create_reversal_in_void(conn, trip_id: int) -> None:
          "amount_cents": -s["amount_cents"]}
         for s in segments
     ]
-    total = -bill["total_cents"]
+    # 等额负数冲销：任意精度整数取反后以十进制文本落库（与账单绝对值完全相等）
+    total = -int(bill["total_cents"])
     conn.execute(
         "INSERT INTO toll_reversals(bill_trip_id, version, total_cents, segments)"
         " VALUES (?, ?, ?, ?)",
-        (trip_id, bill["version"], total, json.dumps(reversal_segments)),
+        (trip_id, bill["version"], str(total), json.dumps(reversal_segments)),
     )
 
 

@@ -173,6 +173,25 @@ NaN），误差仍须非负；任一值非法即 `422 VALIDATION_ERROR`，**整�
 （异常随之带入新修订，读取时同样拒绝）。有效数据的修订继承、误差带
 判定与全部既有接口字段保持兼容；启动与健康检查不受历史异常影响。
 
+**本轮修复：通行费金额边界（费率版本、开单与作废冲销的任意精度整数分）**。
+此前费率与金额以 SQLite INTEGER（int64）落库：提交
+`9223372036854775807` 分/分钟的区间可成功建版，但两分钟确认行程开单时
+总额（`2 × 9223372036854775807 = 18446744073709551614`）越 int64 上限，
+写库溢出报 500；超出 int64 的更大合法费率（如
+`9223372036854775808`）提交建版也会失败。修复后——① **任意精度整数分**：
+合法非负整数费率不设上限，三张表的金额列
+（`toll_rates.rate_cents_per_minute`、`toll_bills.total_cents`、
+`toll_reversals.total_cents`）一律以**十进制文本**落库，计算全程使用
+任意精度整数，HTTP 层以 JSON 整数原样返回——费率与其同固化航时的乘积、
+逐段求和的账单总额、等额负数冲销都保持整数分精确，**不溢出、不截断、
+不经浮点舍入**；② **口径不变**：账单仍取开单时最新费率版本与确认快照
+中的进入分钟、固化航时，旧账单及冲销不随后续费率或航时变化；非法区间
+或开单、作废失败不留部分版本、账单或冲销，重复开单、重复作废及并发
+竞争沿用现有一次生效与重放语义；③ **旧库升级**：既有 INTEGER 金额列
+在启动迁移中重建为 TEXT（单事务、幂等可重入，既有值经 `CAST` 原样
+保留），既有版本、账单、冲销全部照常可查；正常范围的请求、响应字段
+与状态码完全兼容。
+
 ---
 
 ## 1. 启动
@@ -499,6 +518,12 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
     `422 OVERLAPPING_TOLL_RATE_INTERVAL`；未知航段
     `404 SEGMENT_NOT_FOUND`。任一失败**整次拒绝、不生成新版本**，旧版本
     原样保留。
+  - **金额边界（本轮修复）**：合法非负整数费率**不设上限**（如
+    `9223372036854775807` 乃至更大均可建版）；费率、账单总额与冲销总额
+    以**十进制文本**落库、以任意精度整数计算、以 JSON 整数返回——
+    费率 × 固化航时的乘积、逐段求和、等额负数冲销全程保持整数分精确，
+    不溢出、不截断、不经浮点舍入。旧库的 INTEGER 金额列在启动迁移中
+    重建为 TEXT（单事务、幂等），既有版本/账单/冲销的值原样保留可查。
   - **未覆盖分钟费率为 0**：开单时某段进入分钟未命中该航段任何费率区间
     （或该航段在该版本无任何区间），费率取 0，不报错。
   - **版本查询**：`GET /api/toll/rate-versions`（全部版本，各含其全部航段
@@ -690,6 +715,23 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 3. HTTP API
 
+> **本轮用法（通行费金额边界修复：任意精度整数分）**：不新增端点、不改变
+> 既有接口的请求/响应结构与状态码——
+> - `PUT /api/segments/{seg_id}/toll-rates` 的 `rate_cents_per_minute`
+>   接受**任意非负整数**（分/分钟），不再受 int64 上限约束：
+>   `9223372036854775807` 乃至更大值均可建版（`201`）；费率为负仍
+>   `422 INVALID_TOLL_RATE_INTERVAL`、组内交叠仍
+>   `422 OVERLAPPING_TOLL_RATE_INTERVAL`，任一失败整次拒绝、不生成版本；
+> - `POST /api/trips/{id}/bill` 的段金额（费率 × 固化航时）与总额（逐段
+>   求和）越 int64 也精确落库并原样返回（JSON 整数，不转浮点）——例如
+>   费率 `9223372036854775807`、固化航时 2 分钟的行程，账单总额精确为
+>   `18446744073709551614`，不再报 500；
+> - 作废已开单行程生成的等额冲销单（`GET /api/trips/{id}/reversal` 与
+>   账单内嵌 `reversal`）同样是任意精度整数：总额与逐段金额为账单原值
+>   的相反数，绝对值完全相等；
+> - 既有版本、账单、冲销在旧库升级后照常可查（金额列由 INTEGER 重建为
+>   十进制文本，值不变）；重复开单/重复作废/并发竞争的既有语义不变。
+>
 > **本轮用法（潮位数值有限性校验与历史异常安全拒绝）**：不新增端点、
 > 不改变既有接口的请求/响应结构——
 > - `POST /api/tide/corrections` 与 `POST /api/tide/error-revisions` 的
@@ -1336,6 +1378,57 @@ GET /api/trips/7/reversal
   `404 BILL_NOT_FOUND`）；已开单未作废查冲销 `404 REVERSAL_NOT_FOUND`。
 - 重复作废仍返回首次作废记录（200 `replayed:true`），**不重复冲销**。
 
+### 通行费金额边界请求 / 响应示例（本轮修复）
+
+费率与金额是**任意精度整数分**：合法非负整数费率不设上限，乘积、求和与
+等额冲销全程保持整数分精确（不溢出、不截断、不浮点舍入）。
+
+**① int64 上限费率建版 + 两分钟行程开单**（旧实现在此报 500）：
+
+```bash
+# 费率 9223372036854775807 分/分钟（int64 上限）：建版成功
+curl -s -X PUT $BASE/api/segments/5/toll-rates \
+  -H 'Content-Type: application/json' \
+  -d '{"rates":[{"start_minute":0,"end_minute":1440,
+                 "rate_cents_per_minute":9223372036854775807}]}'
+# 201 {"version":4,...,"rates":[...,{"seg_id":5,...,"rate_cents_per_minute":
+#       9223372036854775807}]}
+
+# 固化航时 2 分钟的已确认行程开单：总额 2×9223372036854775807，精确不溢出
+curl -s -X POST $BASE/api/trips/9/bill
+# 201 {"trip_id":9,"version":4,"total_cents":18446744073709551614,
+#      "segments":[{"leg_index":0,"seg_id":5,"entry_minute":0,"travel_time":2,
+#       "rate_cents_per_minute":9223372036854775807,
+#       "amount_cents":18446744073709551614},...],...,"replayed":false}
+```
+
+**② 超出 int64 的更大合法费率**（旧实现建版即失败）：
+
+```bash
+curl -s -X PUT $BASE/api/segments/5/toll-rates \
+  -H 'Content-Type: application/json' \
+  -d '{"rates":[{"start_minute":0,"end_minute":1440,
+                 "rate_cents_per_minute":9223372036854775808}]}'
+# 201 —— 建版成功；GET /api/toll/rate-versions/5 原样返回该精确费率
+```
+
+**③ 越界总额的等额冲销**：作废上述行程，冲销单总额精确为账单相反数：
+
+```bash
+curl -s -X POST $BASE/api/trips/9/void \
+  -H 'Content-Type: application/json' -d '{"reason":"误确认撤销"}'
+curl -s $BASE/api/trips/9/reversal
+# {"trip_id":9,"version":4,"total_cents":-18446744073709551614,
+#  "segments":[{...,"amount_cents":-18446744073709551614}],"reversed_at":"..."}
+```
+
+- 非法输入口径不变：负费率（含越 int64 的大负数）`422
+  INVALID_TOLL_RATE_INTERVAL`、组内交叠 `422
+  OVERLAPPING_TOLL_RATE_INTERVAL`、非整数费率 `422 VALIDATION_ERROR`，
+  任一失败整次拒绝、不生成新版本；
+- 账单仍按开单时最新费率版本与快照进入分钟、固化航时计费；旧账单及冲销
+  不随后续费率变化；重复开单/重复作废/并发语义与正常金额范围完全一致。
+
 ### 船舶档案与船号规划请求 / 响应示例（本轮新增）
 
 **建档**（唯一船号 + 非负吃水/水面以上高度/安全余量 + 启停状态，初始版本 1）：
@@ -1911,6 +2004,27 @@ curl -s $BASE/api/trips/$TID/reversal
 # 200 {"trip_id":1,"version":2,"total_cents":-...,"segments":[...金额取反...],
 #      "reversed_at":"..."}   （未开单 404 BILL_NOT_FOUND；未作废 404 REVERSAL_NOT_FOUND）
 # 重复作废仍 200 replayed=true，不重复冲销
+
+# 0d) 本轮修复：通行费金额边界——任意精度整数分（不溢出、不截断、不浮点舍入）
+#     int64 上限费率 9223372036854775807 分/分钟可建版；
+#     两分钟行程开单总额 18446744073709551614 精确落库（旧实现此处报 500）
+curl -s -X PUT $BASE/api/segments/2/toll-rates \
+  -H 'Content-Type: application/json' \
+  -d '{"rates":[{"start_minute":0,"end_minute":1440,
+                 "rate_cents_per_minute":9223372036854775807}]}'
+# 201 —— 建版成功；超出 int64 的更大合法费率（如 9223372036854775808）同样接受
+curl -s -X PUT $BASE/api/segments/3/toll-rates \
+  -H 'Content-Type: application/json' \
+  -d '{"rates":[{"start_minute":0,"end_minute":1440,
+                 "rate_cents_per_minute":9223372036854775808}]}'
+# 开单/查询/冲销的金额均为精确 JSON 整数（段金额 = 费率 × 固化航时，总额为逐段和）
+TID2=2   # 用另一条已确认行程号替换
+curl -s -X POST $BASE/api/trips/$TID2/bill          # 总额可越 int64，精确不溢出
+curl -s -X POST $BASE/api/trips/$TID2/void \
+  -H 'Content-Type: application/json' -d '{"reason":"误确认撤销"}'
+curl -s $BASE/api/trips/$TID2/reversal              # 等额负数冲销，同样精确
+# 负费率仍 422 INVALID_TOLL_RATE_INTERVAL、非整数费率 422 VALIDATION_ERROR，
+# 失败整次拒绝、不生成新版本；旧库启动自动把金额列重建为十进制文本（值不变）
 
 # 0) 本轮新增：误确认后作废行程（行程号 + 非空原因；重复作废返回首次记录）
 #    （若该行程已开单，作废会在同一事务内生成等额冲销单；作废响应本身不变）
@@ -2665,6 +2779,15 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
    billed_at)`，以及 `toll_reversals(bill_trip_id PK, version, total_cents≤0,
    segments JSON, reversed_at)`。两张主键唯一约束从数据库层兜底重复开单与
    重复冲销；旧库启动随 `SCHEMA` 幂等建表，无需手工迁移。
+   **金额边界（本轮修复）**：三个金额列（费率、账单总额、冲销总额）以
+   **十进制文本（TEXT）**落库——合法非负整数费率没有上限，费率 × 固化
+   航时的乘积、逐段求和与等额负数冲销都是任意精度整数，文本存储使越
+   int64 的金额也精确可存（写入 `str(int)`、读取 `int(text)`，计算全程
+   Python 任意精度整数，HTTP 层以 JSON 整数原样返回，不转浮点）；
+   `segments` 逐段金额本就在 JSON 文本列中，同为任意精度。旧库的
+   INTEGER 金额列由 `_migrate` 在单事务内重建为 TEXT（建新表 →
+   `CAST(... AS TEXT)` 复制 → 删旧 → 改名；外键强制在事务外临时关闭、
+   提交后恢复），既有值原样保留，迁移幂等可重入、中断重启可愈合。
 2. **费率替换**（`replace_segment_rates`，单事务）：先在事务外完成未知航段
    与区间校验（非法 `INVALID_TOLL_RATE_INTERVAL`、交叠
    `OVERLAPPING_TOLL_RATE_INTERVAL`，失败不出版本）；事务内插入版本行，
@@ -2676,12 +2799,14 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
    `TOLL_RATE_VERSION_NOT_FOUND`。通过后取 `MAX(version)` 为当时最新版本，
    逐段以快照 `start_minute`（进入分钟）在该版本区间中选费率
    （`rate_at`，未覆盖返回 0），金额 = 快照固化 `travel_time` × 费率，
-   逐段 JSON 与整数分总额一次落库。新费率版本不触碰历史账单行。
+   逐段 JSON 与整数分总额（十进制文本）一次落库。新费率版本不触碰历史
+   账单行。
 4. **冲销**（`create_reversal_in_void`）：由 `void_trip` 在其**已持有的
    作废事务**内调用，账单不存在为空操作；存在则插入逐段金额取反、总额为
-   账单相反数的冲销行。因开单与作废都在 `BEGIN IMMEDIATE` 下串行：
-   开单先提交 -> 作废同事务必读到账单并写冲销；作废先提交 -> 开单读到
-   作废标识而拒绝。任何顺序下「有账单且已作废 ⇒ 恰有一张等额冲销」。
+   账单相反数的冲销行（任意精度整数取反后以十进制文本落库）。因开单与
+   作废都在 `BEGIN IMMEDIATE` 下串行：开单先提交 -> 作废同事务必读到
+   账单并写冲销；作废先提交 -> 开单读到作废标识而拒绝。任何顺序下
+   「有账单且已作废 ⇒ 恰有一张等额冲销」。
 5. **演示数据**：`SEED_DEMO=true` 的空库初始化时附带费率版本 #1（seg1
    A->B 的 `[0,360)` 2 分、`[360,720)` 1 分、`[720,1440)` 2 分/分钟），
    启动即可体验开单全流程；其余航段未覆盖分钟费率 0。
@@ -2854,10 +2979,10 @@ app/
   services/reschedule.py# 更正后原行程复核与改期 DP（复核只判潮位；改期避开他人组占用且排除自身、按当前管制，只读）
   services/reschedule_confirm.py# 不安全航次改期确认：单事务幂等（重放优先）、档案/修订/不安全/有解校验、新快照+原作废+原账单等额冲销
   services/voids.py     # 误确认作废：事务内作废（重复作废返回首次记录）、作废记录查询；已开单则同事务生成等额冲销
-  services/toll.py      # 通行费：费率版本（整组替换+继承，不可变）、开单（按当时最新版本与快照进入分钟固化）、冲销/查询
+  services/toll.py      # 通行费：费率版本（整组替换+继承，不可变）、开单（按当时最新版本与快照进入分钟固化）、冲销/查询；金额以十进制文本落库（任意精度整数分）
   services/ships.py     # 船舶档案：建档/版本化变更（单事务）、当前与历史版本查询、规划/确认用档案解析
   main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/船舶档案/潮位更正与误差修订/单船与批次规划确认/复核改期/改期确认/作废）
-tests/                  # pytest 测试（268 个，含择优、缺潮位、事务冲突、误差带、复核改期、改期确认与幂等/冲销、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行、船舶档案与船号规划确认、潮位差量链式存储与旧库升级、潮位数值有限性校验与历史异常拒绝等）
+tests/                  # pytest 测试（276 个，含择优、缺潮位、事务冲突、误差带、复核改期、改期确认与幂等/冲销、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行、船舶档案与船号规划确认、潮位差量链式存储与旧库升级、潮位数值有限性校验与历史异常拒绝、通行费金额边界与旧库金额列升级等）
 Dockerfile
 docker-compose.yml
 requirements.txt
